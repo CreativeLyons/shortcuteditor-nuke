@@ -45,6 +45,35 @@ hardwired.
 If you are changing an existing shortcut, be sure to clear the old usage of
 the key. A popup appears to help with this if adding conflicting shortcuts.
 
+### Missing/Orphaned Shortcuts
+
+If your shortcuts JSON file contains entries for menu commands that no longer
+exist in Nuke (e.g., after upgrading Nuke or removing plugins), those shortcuts
+will be silently skipped during startup to avoid terminal warnings. The entries
+remain in your JSON file and are preserved when saving.
+
+To enable debug logging for missing menu items, set the environment variable:
+```bash
+export SHORTCUTEDITOR_DEBUG=1
+```
+This will print a single warning per missing menu item when Nuke starts.
+
+### Show Only Changed Shortcuts
+
+The shortcut editor includes a "Show only changed shortcuts" filter toggle in the
+Filtering section. When enabled, the list displays only shortcuts that have been
+modified by the user, making it easier to review your customizations.
+
+A shortcut is considered "changed" if it exists in your preferences JSON file,
+which includes:
+- Shortcuts you've added (where the default was empty)
+- Default shortcuts you've modified to different key sequences
+- Default shortcuts you've cleared/removed
+- Missing/orphaned shortcuts that you previously configured
+
+The filter state (on/off) is saved in your preferences file and persists between
+sessions. This filter works in combination with the text and key search filters.
+
 
 ## Future improvements
 

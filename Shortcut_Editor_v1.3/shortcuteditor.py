@@ -21,6 +21,7 @@ import nuke
 import os
 import sys
 import json
+import hashlib
 
 try:
     # Prefer Qt.py when available
@@ -47,6 +48,33 @@ except ImportError:
 
 if sys.version_info[0] >= 3:
     basestring = str
+
+# Debug flag for logging missing/orphaned menu items
+# Set to True to enable warnings for shortcuts that reference non-existent menu commands
+# Can also be set via environment variable: SHORTCUTEDITOR_DEBUG=1
+DEBUG_MISSING_ITEMS = os.environ.get('SHORTCUTEDITOR_DEBUG', '0').lower() in ('1', 'true', 'yes')
+
+# Debug flag for printing conflict/orphaned statistics
+# Set to True to enable one-line summary of conflicts and orphaned shortcuts
+# Can also be set via environment variable: SHORTCUTEDITOR_DEBUG_STATS=1
+DEBUG_STATS = os.environ.get('SHORTCUTEDITOR_DEBUG_STATS', '0').lower() in ('1', 'true', 'yes')
+
+# Module-level guard to ensure debug stats print at most once per session
+_debug_stats_printed_conflicts = False
+_debug_stats_printed_orphaned = False
+
+# Module-level cache for default shortcuts (captured before user prefs are applied)
+_default_shortcuts_cache = None
+
+# Pastel color palette for status indicators (suitable for dark UI with light text)
+STATUS_COLORS = {
+    'ADDED': '#7FD4B6',      # Soft teal/green
+    'CLEARED': '#D4A5D4',    # Soft lavender/purple (more distinct from ADDED)
+    'REPLACED': '#E8C97F',   # Soft amber/yellow
+    'UNCHANGED': '#A0A0A0',  # Muted gray
+    'CONFLICT': '#E87F7F',   # Soft red (for conflict badges)
+    'CONFLICT_BG': '#3A2525', # Subtle red-tinted background (dark)
+}
 
 def _qt_int(val):
     """Helper to handle Qt6 Enums that don't cast to int directly"""
@@ -310,6 +338,11 @@ def _find_menu_items(menu, _path=None, _top_menu_name=None):
 
     if _top_menu_name is None:
         _top_menu_name = menu.name()
+        # Ensure we have a valid context name (use stable unique ID if empty/None)
+        if not _top_menu_name:
+            # Use object id to create stable unique context identifier
+            # This prevents false conflicts across different unnamed menus
+            _top_menu_name = "_unnamed_menu_%x" % id(menu)
 
     found = []
 
@@ -374,6 +407,63 @@ def _load_yaml(path):
         return None
 
 
+def _normalize_shortcut(shortcut):
+    """Normalize a shortcut string for comparison.
+    
+    Converts QKeySequence objects to strings, handles empty/None values,
+    and normalizes whitespace and case for reliable comparison.
+    """
+    if shortcut is None:
+        return ""
+    if hasattr(shortcut, 'toString'):
+        # QKeySequence object
+        result = shortcut.toString()
+    elif isinstance(shortcut, basestring):
+        result = shortcut
+    else:
+        try:
+            result = str(shortcut)
+        except Exception:
+            return ""
+    
+    # Normalize: strip whitespace, convert to empty string if falsy
+    result = result.strip() if result else ""
+    return result
+
+
+def _capture_default_shortcuts():
+    """Capture default shortcuts from all menu items before user prefs are applied.
+    
+    Returns a dict mapping command identifiers (menu_name/path) to their
+    default shortcut strings. This snapshot can be used to determine if
+    a shortcut has been changed by the user.
+    
+    Note: This should be called before user preferences are restored,
+    otherwise it will capture shortcuts that already include user changes.
+    """
+    defaults = {}
+    
+    for menu_name in ("Nodes", "Nuke", "Viewer", "Node Graph"):
+        try:
+            m = nuke.menu(menu_name)
+            if m:
+                items = _find_menu_items(m)
+                for item in items:
+                    try:
+                        raw_shortcut = item['menuobj'].action().shortcut()
+                        shortcut_str = _normalize_shortcut(raw_shortcut)
+                        cmd_key = "%s/%s" % (item['top_menu_name'], item['menupath'])
+                        defaults[cmd_key] = shortcut_str
+                    except Exception:
+                        # Skip items that can't be accessed
+                        continue
+        except Exception:
+            # Skip menus that don't exist or can't be accessed
+            continue
+    
+    return defaults
+
+
 def _save_yaml(obj, path):
     def _save_internal():
         ndir = os.path.dirname(path)
@@ -405,14 +495,53 @@ def _save_yaml(obj, path):
 
 
 def _restore_overrides(overrides):
-    for item, key in overrides.items():
-        menu_name, _, path = item.partition("/")
-        m = nuke.menu(menu_name)
-        item = m.findItem(path)
-        if item is None:
-            nuke.warning("WARNING: %r (menu: %r) does not exist?" % (path, menu_name))
+    """Restore keyboard shortcuts from saved overrides.
+    
+    Only applies shortcuts to menu items that exist in Nuke. If a shortcut
+    references a non-existent menu command, it is skipped (to avoid Nuke warnings)
+    but preserved in the overrides dictionary so it remains in the JSON file.
+    
+    Missing/orphaned shortcuts can be logged by enabling DEBUG_MISSING_ITEMS
+    or setting the SHORTCUTEDITOR_DEBUG environment variable.
+    """
+    missing_items = set()  # Track missing items for deduplicated logging
+    
+    for item_key, shortcut_key in overrides.items():
+        menu_name, _, path = item_key.partition("/")
+        
+        # Get the menu object
+        try:
+            m = nuke.menu(menu_name)
+            if m is None:
+                # Menu doesn't exist
+                if DEBUG_MISSING_ITEMS:
+                    missing_items.add((path, menu_name))
+                continue
+        except Exception:
+            # Menu access failed
+            if DEBUG_MISSING_ITEMS:
+                missing_items.add((path, menu_name))
+            continue
+        
+        # Find the menu item
+        menu_item = m.findItem(path)
+        if menu_item is None:
+            # Menu item doesn't exist - skip applying shortcut but keep in overrides
+            if DEBUG_MISSING_ITEMS:
+                missing_items.add((path, menu_name))
         else:
-            item.setShortcut(key)
+            # Menu item exists - apply the shortcut
+            try:
+                menu_item.setShortcut(shortcut_key)
+            except Exception:
+                # If setShortcut fails, log it if debug is enabled
+                if DEBUG_MISSING_ITEMS:
+                    missing_items.add((path, menu_name))
+    
+    # Log missing items once (deduplicated) if debug is enabled
+    if DEBUG_MISSING_ITEMS and missing_items:
+        for path, menu_name in sorted(missing_items):
+            nuke.warning("ShortcutEditor: Menu item %r (menu: %r) does not exist, skipping shortcut" % (path, menu_name))
 
 
 def _overrides_as_code(overrides):
@@ -436,31 +565,63 @@ def _overrides_as_code(overrides):
 class Overrides(object):
     def __init__(self):
         self.settings_path = os.path.expanduser("~/.nuke/shortcuteditor_settings.json")
+        self.ui_prefs = {}  # UI preferences like show_only_changed
 
     def save(self):
+        """Save settings to disk.
+        
+        Ensures UI preferences are saved without modifying shortcut mappings.
+        The 'overrides' dict is preserved exactly as-is.
+        """
         settings = {
-            'overrides': self.overrides,
+            'overrides': self.overrides.copy(),  # Explicit copy to ensure no mutation
             'version': 1,
         }
+        # Add UI preferences if they exist (separate key, does not modify overrides)
+        if self.ui_prefs:
+            settings['ui'] = self.ui_prefs.copy()  # Explicit copy for safety
         _save_yaml(obj=settings, path=self.settings_path)
 
     def clear(self):
         self.overrides = {}
         self.save()
 
+    def load_settings_file(self):
+        """Load settings file without applying shortcuts.
+        
+        Returns the loaded settings dict, or None if file doesn't exist.
+        Useful for reading user preferences without modifying Nuke state.
+        """
+        return _load_yaml(path=self.settings_path)
+
     def restore(self):
         """Load the settings from disc, and update Nuke
+        
+        Captures default shortcuts before applying user preferences,
+        storing them in the module-level cache for use by the UI widget.
         """
+        global _default_shortcuts_cache
+        
+        # Only capture defaults if cache is empty (first time, before user prefs applied)
+        # If cache already exists, don't overwrite it (it contains true defaults)
+        if _default_shortcuts_cache is None:
+            # Capture defaults BEFORE applying user prefs
+            _default_shortcuts_cache = _capture_default_shortcuts()
+        
         settings = _load_yaml(path=self.settings_path)
 
         # Default
         self.overrides = {}
+        self.ui_prefs = {}
 
         if settings is None:
             return
 
         elif int(settings['version']) == 1:
             self.overrides = settings['overrides']
+            # Load UI preferences if they exist (backwards compatible)
+            if 'ui' in settings and isinstance(settings['ui'], dict):
+                self.ui_prefs = settings['ui']
             _restore_overrides(self.overrides)
 
         else:
@@ -487,6 +648,8 @@ class ShortcutEditorWidget(QtWidgets.QDialog):
         # Internal things
         self._search_timer = None
         self._cache_items = None
+        # Track which commands are in user prefs (changed shortcuts)
+        self._user_prefs_map = self.settings.overrides.copy()
 
         # Stack widgets atop each other
         layout = QtWidgets.QVBoxLayout()
@@ -494,31 +657,65 @@ class ShortcutEditorWidget(QtWidgets.QDialog):
 
         # Search group
         search_group = QtWidgets.QGroupBox("Filtering")
-        search_layout = QtWidgets.QHBoxLayout()
+        search_layout = QtWidgets.QVBoxLayout()
         search_group.setLayout(search_layout)
 
-        layout.addWidget(search_group)
+        # Top row: search filters
+        search_row = QtWidgets.QHBoxLayout()
+        search_layout.addLayout(search_row)
 
         # By-key filter bar
         key_filter = KeySequenceWidget()
         key_filter.keySequenceChanged.connect(self.filter_entries)
         self.key_filter = key_filter
 
-        search_layout.addWidget(_widget_with_label(key_filter, "Search by key"))
+        search_row.addWidget(_widget_with_label(key_filter, "Search by key"))
 
         # text filter bar
         search_input = QtWidgets.QLineEdit()
         search_input.textChanged.connect(self.search)
         self.search_input = search_input
-        search_layout.addWidget(
+        search_row.addWidget(
             _widget_with_label(search_input, "Search by text"))
+
+        # Bottom row: filter toggles
+        filter_row = QtWidgets.QHBoxLayout()
+        search_layout.addLayout(filter_row)
+        
+        # Show user-altered shortcuts toggle
+        show_changed_checkbox = QtWidgets.QCheckBox("Show User-Altered Shortcuts")
+        show_changed_checkbox.setToolTip(
+            "Filter to show only shortcuts that differ from Nuke's defaults.\n"
+            "Includes: shortcuts added, changed, or cleared by the user.")
+        # Load saved state (defaults to False if not set)
+        show_changed_state = self.settings.ui_prefs.get('show_only_changed', False)
+        show_changed_checkbox.setChecked(show_changed_state)
+        show_changed_checkbox.stateChanged.connect(self.on_show_changed_toggled)
+        self.show_changed_checkbox = show_changed_checkbox
+        filter_row.addWidget(show_changed_checkbox)
+        
+        # Show only conflicts toggle
+        show_conflicts_checkbox = QtWidgets.QCheckBox("Show Only Conflicts")
+        show_conflicts_checkbox.setToolTip(
+            "Filter to show only shortcuts that have conflicts within the same context.\n"
+            "Conflicts occur when multiple commands share the same shortcut in the same menu.")
+        # Load saved state (defaults to False if not set)
+        show_conflicts_state = self.settings.ui_prefs.get('show_only_conflicts', False)
+        show_conflicts_checkbox.setChecked(show_conflicts_state)
+        show_conflicts_checkbox.stateChanged.connect(self.on_show_conflicts_toggled)
+        self.show_conflicts_checkbox = show_conflicts_checkbox
+        filter_row.addWidget(show_conflicts_checkbox)
+
+        layout.addWidget(search_group)
 
         # Main table
         table = QtWidgets.QTableWidget()
-        table.setColumnCount(2)
+        table.setColumnCount(3)  # Shortcut, Status, Menu location
 
-        table.setColumnWidth(0, 150)
-        table.horizontalHeader().setStretchLastSection(True)
+        table.setColumnWidth(0, 150)  # Shortcut
+        # Status column: will be auto-sized after populating, start with reasonable default
+        table.setColumnWidth(1, 80)  # Default width, will be adjusted to fit content
+        table.horizontalHeader().setStretchLastSection(True)  # Menu location
         table.verticalHeader().setVisible(False)
 
         self.table = table
@@ -560,11 +757,198 @@ class ShortcutEditorWidget(QtWidgets.QDialog):
             self._search_timer.timeout.connect(self.filter_entries)
             self._search_timer.start(200)  # 200ms timeout
 
+    def is_changed(self, menuitem):
+        """Determine if a shortcut has been changed by the user.
+        
+        A shortcut is considered "changed" if it exists in the user preferences
+        JSON file, indicating the user has explicitly interacted with it.
+        
+        Changed shortcuts include:
+        - Shortcuts added where default was empty/none (user added a shortcut)
+        - Default shortcuts changed to different key sequences (user modified it)
+        - Default shortcuts removed/cleared (set to empty string in prefs)
+        - Missing/orphaned shortcuts that exist in user prefs (user set it, but
+          the command was later removed from Nuke)
+        
+        Note: This method compares against the user preferences JSON, not against
+        Nuke's current defaults. Since user prefs are applied on startup before
+        the widget opens, we use the JSON file as the source of truth for what
+        the user has changed.
+        
+        Returns True if the shortcut has been changed, False otherwise.
+        """
+        cmd_key = "%s/%s" % (menuitem['top_menu_name'], menuitem['menupath'])
+        # If command is in user prefs, it's been changed (user interacted with it)
+        return cmd_key in self._user_prefs_map
+
+    def get_change_status(self, menuitem):
+        """Compute the change status for a menu item.
+        
+        Returns one of: 'ADDED', 'CLEARED', 'REPLACED', 'UNCHANGED'
+        
+        Status rules:
+        - ADDED: user assigned a shortcut where default was empty/none
+        - CLEARED: user removed a default shortcut (default had one, user now empty)
+        - REPLACED: user shortcut differs from default (both non-empty and different)
+        - UNCHANGED: same as default (no user override, or override matches default)
+        """
+        global _default_shortcuts_cache
+        
+        cmd_key = "%s/%s" % (menuitem['top_menu_name'], menuitem['menupath'])
+        
+        # Get default shortcut (normalized)
+        default_shortcut = ""
+        if _default_shortcuts_cache and cmd_key in _default_shortcuts_cache:
+            default_shortcut = _normalize_shortcut(_default_shortcuts_cache[cmd_key])
+        
+        # Get user shortcut (normalized) - empty string if not in user prefs
+        user_shortcut = ""
+        if cmd_key in self._user_prefs_map:
+            user_shortcut = _normalize_shortcut(self._user_prefs_map[cmd_key])
+        
+        # Determine status
+        if cmd_key not in self._user_prefs_map:
+            # No user override - unchanged
+            return 'UNCHANGED'
+        
+        # User has an override entry
+        if not default_shortcut and user_shortcut:
+            # Default was empty, user added one
+            return 'ADDED'
+        elif default_shortcut and not user_shortcut:
+            # Default had one, user cleared it
+            return 'CLEARED'
+        elif default_shortcut and user_shortcut:
+            if default_shortcut == user_shortcut:
+                # User override matches default (redundant override)
+                return 'UNCHANGED'
+            else:
+                # User changed it to something different
+                return 'REPLACED'
+        else:
+            # Both empty - unchanged
+            return 'UNCHANGED'
+
+    def get_effective_shortcut(self, menuitem):
+        """Get the effective shortcut for a menu item.
+        
+        Returns the user shortcut if present, otherwise the default shortcut.
+        Normalized for comparison.
+        """
+        global _default_shortcuts_cache
+        
+        cmd_key = "%s/%s" % (menuitem['top_menu_name'], menuitem['menupath'])
+        
+        # Check user prefs first
+        if cmd_key in self._user_prefs_map:
+            return _normalize_shortcut(self._user_prefs_map[cmd_key])
+        
+        # Fall back to default
+        if _default_shortcuts_cache and cmd_key in _default_shortcuts_cache:
+            return _normalize_shortcut(_default_shortcuts_cache[cmd_key])
+        
+        # Orphaned command - get from menuitem if available
+        if menuitem.get('orphaned', False):
+            return _normalize_shortcut(menuitem.get('shortcut_str', ''))
+        
+        return ""
+
+    def detect_conflicts(self, menu_items):
+        """Detect conflicts where multiple commands share the same effective shortcut.
+        
+        Conflicts are detected PER CONTEXT (menu). The same shortcut can be used
+        in different contexts (e.g., "Node Graph" vs "Viewer") without conflict.
+        A conflict only occurs when the same shortcut is used multiple times
+        within the same context.
+        
+        Returns a dict mapping command keys to lists of conflicting command keys
+        (within the same context). Only includes shortcuts that are non-empty.
+        """
+        # Build map: (context, effective_shortcut) -> list of command keys
+        context_shortcut_to_commands = {}
+        
+        for menuitem in menu_items:
+            cmd_key = "%s/%s" % (menuitem['top_menu_name'], menuitem['menupath'])
+            # Get context, ensuring it's never None/empty (use stable unique ID if needed)
+            context = menuitem.get('top_menu_name')
+            if not context:
+                # Fallback: create stable unique ID from cmd_key using SHA1
+                context = "_unnamed_context_%s" % hashlib.sha1(cmd_key.encode("utf-8")).hexdigest()[:10]
+            effective = self.get_effective_shortcut(menuitem)
+            
+            # Ignore empty shortcuts
+            if effective:
+                context_shortcut_key = (context, effective)
+                if context_shortcut_key not in context_shortcut_to_commands:
+                    context_shortcut_to_commands[context_shortcut_key] = []
+                context_shortcut_to_commands[context_shortcut_key].append(cmd_key)
+        
+        # Build conflict map: command -> list of conflicting commands (same context only)
+        conflicts = {}
+        for (context, shortcut), cmd_keys in context_shortcut_to_commands.items():
+            if len(cmd_keys) > 1:
+                # This shortcut has conflicts within this context
+                for cmd_key in cmd_keys:
+                    # List all other commands sharing this shortcut in the same context
+                    conflicts[cmd_key] = [c for c in cmd_keys if c != cmd_key]
+        
+        # Debug statistics logging (at most once per session)
+        global _debug_stats_printed_conflicts
+        if DEBUG_STATS and not _debug_stats_printed_conflicts:
+            conflict_count = len(conflicts)
+            print("ShortcutEditor: %d conflicts detected across all contexts" % conflict_count)
+            _debug_stats_printed_conflicts = True
+        
+        return conflicts
+
+    def on_show_changed_toggled(self, state):
+        """Handle the "Show User-Altered Shortcuts" checkbox toggle.
+        
+        Saves the state to UI preferences and refreshes the filter.
+        """
+        is_checked = (state == Qt.Checked)
+        self.settings.ui_prefs['show_only_changed'] = is_checked
+        self.settings.save()
+        # Refresh the filter to apply the new state
+        self.filter_entries()
+
+    def on_show_conflicts_toggled(self, state):
+        """Handle the "Show Only Conflicts" checkbox toggle.
+        
+        Saves the state to UI preferences and refreshes the filter.
+        """
+        is_checked = (state == Qt.Checked)
+        self.settings.ui_prefs['show_only_conflicts'] = is_checked
+        self.settings.save()
+        # Refresh the filter to apply the new state
+        self.filter_entries()
+
     def filter_entries(self):
         """Iterate through the rows in the table and hide/show according to filters
+        
+        Filters by:
+        - Text search (menu path)
+        - Key sequence search
+        - "Show User-Altered Shortcuts" toggle (if enabled)
+        - "Show Only Conflicts" toggle (if enabled)
+        
+        Note: This function does NOT mutate the underlying data. It only controls
+        row visibility. The master list from list_menu() remains unchanged.
         """
-        # We use the fact that self.list_menu() would never change to our advantage
+        # Get the master list (this is never mutated, only used for filtering)
         menu_items = self.list_menu()
+        show_only_changed = self.show_changed_checkbox.isChecked()
+        show_only_conflicts = self.show_conflicts_checkbox.isChecked()
+        
+        # Detect conflicts once if needed for filtering
+        conflicts = None
+        if show_only_conflicts:
+            conflicts = self.detect_conflicts(menu_items)
+        
+        # Ensure we have enough rows in the table
+        current_row_count = self.table.rowCount()
+        if len(menu_items) > current_row_count:
+            self.table.setRowCount(len(menu_items))
 
         for rownum, menuitem in enumerate(menu_items):
             # filter them, first by the input text
@@ -575,54 +959,209 @@ class ShortcutEditorWidget(QtWidgets.QDialog):
             key_match = True
             filter_seq = self.key_filter.shortcut()
             if not filter_seq.isEmpty():
-                current_sc = menuitem['menuobj'].action().shortcut()
-                if isinstance(current_sc, basestring):
-                    current_sc = QtGui.QKeySequence(current_sc)
+                # Handle orphaned commands (no menuobj)
+                if menuitem.get('orphaned', False):
+                    shortcut_str = menuitem.get('shortcut_str', '')
+                    current_sc = QtGui.QKeySequence(shortcut_str)
+                else:
+                    current_sc = menuitem['menuobj'].action().shortcut()
+                    if isinstance(current_sc, basestring):
+                        current_sc = QtGui.QKeySequence(current_sc)
                 
                 key_match = current_sc == filter_seq
 
-            keep_result = all([found, key_match])
+            # Filter by "show only changed" if enabled
+            changed_match = True
+            if show_only_changed:
+                status = self.get_change_status(menuitem)
+                # Show only ADDED, CLEARED, REPLACED (not UNCHANGED)
+                changed_match = status != 'UNCHANGED'
+
+            # Filter by "show only conflicts" if enabled
+            conflict_match = True
+            if show_only_conflicts:
+                cmd_key = "%s/%s" % (menuitem['top_menu_name'], menuitem['menupath'])
+                conflict_match = cmd_key in conflicts
+
+            keep_result = all([found, key_match, changed_match, conflict_match])
+            # Explicitly show/hide each row based on filter result
             self.table.setRowHidden(rownum, not keep_result)
+        
+        # Ensure any extra rows beyond menu_items are hidden
+        for rownum in range(len(menu_items), self.table.rowCount()):
+            self.table.setRowHidden(rownum, True)
 
     def list_menu(self):
         """Gets the list-of-dicts containing all menu items
 
-        Caches for speed of filtering
+        Includes both existing menu items and orphaned/missing commands
+        that exist in user preferences. Caches for speed of filtering.
         """
         if self._cache_items is not None:
             return self._cache_items
         else:
             items = []
+            existing_cmd_keys = set()
+            
+            # Get all existing menu items
             for menu in ("Nodes", "Nuke", "Viewer", "Node Graph"):
                 m = nuke.menu(menu)
                 if m:
-                    items.extend(_find_menu_items(m))
+                    menu_items = _find_menu_items(m)
+                    items.extend(menu_items)
+                    # Track which commands exist
+                    for item in menu_items:
+                        cmd_key = "%s/%s" % (item['top_menu_name'], item['menupath'])
+                        existing_cmd_keys.add(cmd_key)
+            
+            # Add orphaned/missing commands from user prefs
+            orphaned_count = 0
+            for cmd_key, shortcut_str in self._user_prefs_map.items():
+                if cmd_key not in existing_cmd_keys:
+                    # This is an orphaned command - create a placeholder entry
+                    menu_name, _, path = cmd_key.partition("/")
+                    # Ensure menu_name is never empty (use stable unique ID)
+                    if not menu_name:
+                        # Use SHA1 of cmd_key to create stable unique identifier
+                        menu_name = "_unnamed_orphan_%s" % hashlib.sha1(cmd_key.encode("utf-8")).hexdigest()[:10]
+                    items.append({
+                        'menuobj': None,  # No menu object for orphaned commands
+                        'menupath': path,
+                        'top_menu_name': menu_name,
+                        'orphaned': True,  # Mark as orphaned
+                        'shortcut_str': shortcut_str  # Store the shortcut from prefs
+                    })
+                    orphaned_count += 1
+            
+            # Debug statistics logging (at most once per session)
+            global _debug_stats_printed_orphaned
+            if DEBUG_STATS and not _debug_stats_printed_orphaned:
+                print("ShortcutEditor: %d orphaned shortcuts in user prefs" % orphaned_count)
+                _debug_stats_printed_orphaned = True
+            
             self._cache_items = items
             return items
 
+    def _create_status_badge(self, status):
+        """Create a status label with text color only (no background).
+        
+        For UNCHANGED: returns empty label (blank cell).
+        For ADDED/CLEARED/REPLACED: returns label with colored text only.
+        """
+        if status == 'UNCHANGED':
+            # Return empty label for UNCHANGED
+            return QtWidgets.QLabel("")
+        
+        label = QtWidgets.QLabel(status)
+        color = STATUS_COLORS.get(status, STATUS_COLORS['UNCHANGED'])
+        # Use text color only, no background, with padding for readability
+        label.setStyleSheet(
+            "color: %s; "
+            "font-size: 10px; "
+            "font-weight: bold; "
+            "padding: 2px 4px; "
+            "margin: 1px;" % color
+        )
+        label.setAlignment(Qt.AlignCenter)
+        # Ensure label has proper size hint for column auto-sizing
+        label.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
+        return label
+
+    def _create_conflict_tooltip(self, conflicting_commands):
+        """Create a conflict tooltip text."""
+        if not conflicting_commands:
+            return ""
+        
+        tooltip = "Conflict: This shortcut is also assigned to:\n"
+        tooltip += "\n".join("  • %s" % cmd for cmd in conflicting_commands[:5])
+        if len(conflicting_commands) > 5:
+            tooltip += "\n  ... and %d more" % (len(conflicting_commands) - 5)
+        return tooltip
+
     def populate(self):
-        # Get menu items
+        # Get menu items (includes orphaned commands)
         menu_items = self.list_menu()
+        
+        # Detect conflicts
+        conflicts = self.detect_conflicts(menu_items)
 
         # Setup table
         self.table.clear()
         self.table.setRowCount(len(menu_items))
-        self.table.setHorizontalHeaderLabels(['Shortcut', 'Menu location'])
+        self.table.setHorizontalHeaderLabels(['Shortcut', 'Status', 'Menu location'])
 
         # Add items
         for rownum, menuitem in enumerate(menu_items):
-            raw_shortcut = menuitem['menuobj'].action().shortcut()
-            shortcut = QtGui.QKeySequence(raw_shortcut)
+            cmd_key = "%s/%s" % (menuitem['top_menu_name'], menuitem['menupath'])
+            status = self.get_change_status(menuitem)
+            conflicting_commands = conflicts.get(cmd_key, [])
+            conflict_tooltip = self._create_conflict_tooltip(conflicting_commands)
+            
+            # Handle orphaned commands (no menuobj)
+            if menuitem.get('orphaned', False):
+                # Orphaned command - use shortcut from prefs
+                shortcut_str = menuitem.get('shortcut_str', '')
+                shortcut = QtGui.QKeySequence(shortcut_str)
+                
+                widget = KeySequenceWidget()
+                widget.setShortcut(shortcut)
+                # Disable editing for orphaned commands (they can't be applied)
+                widget.setEnabled(False)
+                base_tooltip = "This menu command no longer exists in Nuke"
+                if conflict_tooltip:
+                    widget.setToolTip("%s\n\n%s" % (base_tooltip, conflict_tooltip))
+                else:
+                    widget.setToolTip(base_tooltip)
+                
+                self.table.setCellWidget(rownum, 0, widget)  # Shortcut column
+            else:
+                # Normal menu item
+                raw_shortcut = menuitem['menuobj'].action().shortcut()
+                shortcut = QtGui.QKeySequence(raw_shortcut)
 
-            widget = KeySequenceWidget()
-            widget.setShortcut(shortcut)
+                widget = KeySequenceWidget()
+                widget.setShortcut(shortcut)
+                
+                # Always set tooltip (empty string clears it if no conflicts)
+                # This ensures tooltips update immediately when conflicts are resolved
+                widget.setToolTip(conflict_tooltip if conflict_tooltip else "")
 
-            self.table.setCellWidget(rownum, 0, widget)
-            self.table.setCellWidget(rownum, 1, QtWidgets.QLabel("%s (menu: %s)" % (menuitem['menupath'],
-                                                                                    menuitem['top_menu_name'])))
+                self.table.setCellWidget(rownum, 0, widget)  # Shortcut column
 
-            widget.keySequenceChanged.connect(lambda menu_item=menuitem, w=widget: self.setkey(menuitem=menu_item,
-                                                                                               shortcut_widget=w))
+                widget.keySequenceChanged.connect(lambda menu_item=menuitem, w=widget: self.setkey(menuitem=menu_item,
+                                                                                                   shortcut_widget=w))
+            
+            # Status badge (column 1)
+            status_badge = self._create_status_badge(status)
+            self.table.setCellWidget(rownum, 1, status_badge)
+            
+            # Menu location (column 2)
+            if menuitem.get('orphaned', False):
+                label_text = "%s (menu: %s) [Missing]" % (menuitem['menupath'], menuitem['top_menu_name'])
+            else:
+                label_text = "%s (menu: %s)" % (menuitem['menupath'], menuitem['top_menu_name'])
+            self.table.setCellWidget(rownum, 2, QtWidgets.QLabel(label_text))
+            
+            # Apply conflict highlighting (subtle red-tinted background)
+            if conflicting_commands:
+                for col in range(3):
+                    item = self.table.item(rownum, col)
+                    if item is None:
+                        item = QtWidgets.QTableWidgetItem()
+                        self.table.setItem(rownum, col, item)
+                    item.setBackground(QtGui.QColor(STATUS_COLORS['CONFLICT_BG']))
+        
+        # Auto-resize Status column to fit content (ensure all status text is visible)
+        # Process events to ensure widgets are rendered before measuring
+        QtWidgets.QApplication.processEvents()
+        self.table.resizeColumnToContents(1)
+        # Add padding to prevent text cutoff and improve readability
+        current_width = self.table.columnWidth(1)
+        if current_width > 0:
+            self.table.setColumnWidth(1, current_width + 12)  # Add 12px padding for margins
+        
+        # Reapply filters after populating (to respect filter toggle states)
+        self.filter_entries()
 
     def setkey(self, menuitem, shortcut_widget):
         """Called when shortcut is edited
@@ -634,6 +1173,10 @@ class ShortcutEditorWidget(QtWidgets.QDialog):
         shortcut_str = shortcut_widget.shortcut().toString()
         menu_items = self.list_menu()
         for index, other_item in enumerate(menu_items):
+            # Skip orphaned items when checking conflicts (they can't have active shortcuts)
+            if other_item.get('orphaned', False):
+                continue
+                
             other_sc = other_item['menuobj'].action().shortcut()
             if hasattr(other_sc, 'toString'):
                 other_sc = other_sc.toString()
@@ -644,21 +1187,35 @@ class ShortcutEditorWidget(QtWidgets.QDialog):
                 answer = self._confirm_override(other_item, shortcut_str)
                 if answer is None:
                     # Cancel editing - reset widget to original key then stop
-                    shortcut_widget.setShortcut(QtGui.QKeySequence(menuitem['menuobj'].action().shortcut()))
+                    if not menuitem.get('orphaned', False):
+                        shortcut_widget.setShortcut(QtGui.QKeySequence(menuitem['menuobj'].action().shortcut()))
                     return
                 elif answer is True:
                     # Un-assign the shortcut first
-                    other_item['menuobj'].setShortcut('')
-                    self.settings.overrides["%s/%s" % (other_item['top_menu_name'], other_item['menupath'])] = ""
+                    if not other_item.get('orphaned', False):
+                        other_item['menuobj'].setShortcut('')
+                    other_cmd_key = "%s/%s" % (other_item['top_menu_name'], other_item['menupath'])
+                    self.settings.overrides[other_cmd_key] = ""
+                    # Update user prefs map for "show only changed" filter
+                    self._user_prefs_map[other_cmd_key] = ""
                     if self.table.cellWidget(index, 0):
                         self.table.cellWidget(index, 0).setShortcut(QtGui.QKeySequence(""))
                 elif answer is False:
                     # Keep both shortcuts
                     pass
 
-        menuitem['menuobj'].setShortcut(shortcut_str)
-        self.settings.overrides[
-            "%s/%s" % (menuitem['top_menu_name'], menuitem['menupath'])] = shortcut_str
+        # Only set shortcut if menu item exists (not orphaned)
+        if not menuitem.get('orphaned', False):
+            menuitem['menuobj'].setShortcut(shortcut_str)
+        
+        cmd_key = "%s/%s" % (menuitem['top_menu_name'], menuitem['menupath'])
+        self.settings.overrides[cmd_key] = shortcut_str
+        # Update user prefs map for "show only changed" filter
+        self._user_prefs_map[cmd_key] = shortcut_str
+        
+        # Invalidate cache and refresh table to update status/conflict indicators
+        self._cache_items = None
+        self.populate()  # populate() will call filter_entries() at the end
 
     def _confirm_override(self, menu_item, shortcut):
         """Ask the user if they are sure they want to override the shortcut
@@ -711,6 +1268,8 @@ class ShortcutEditorWidget(QtWidgets.QDialog):
 
         if ret == QtWidgets.QMessageBox.Reset:
             self.settings.clear()
+            # Clear user prefs map since all overrides are cleared
+            self._user_prefs_map = {}
             self.close()
             QtWidgets.QMessageBox.information(None, "Reset complete", "You must restart Nuke for this to take effect")
         elif ret == QtWidgets.QMessageBox.Cancel:

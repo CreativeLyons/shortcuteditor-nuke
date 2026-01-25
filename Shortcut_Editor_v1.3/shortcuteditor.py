@@ -1105,15 +1105,18 @@ class ShortcutEditorWidget(QtWidgets.QDialog):
                 
                 widget = KeySequenceWidget()
                 widget.setShortcut(shortcut)
-                # Disable editing for orphaned commands (they can't be applied)
-                widget.setEnabled(False)
-                base_tooltip = "This menu command no longer exists in Nuke"
+                # Allow editing orphaned commands so user can clear them from preferences
+                base_tooltip = "This menu command no longer exists in Nuke. You can clear the shortcut to remove it from preferences."
                 if conflict_tooltip:
                     widget.setToolTip("%s\n\n%s" % (base_tooltip, conflict_tooltip))
                 else:
                     widget.setToolTip(base_tooltip)
                 
                 self.table.setCellWidget(rownum, 0, widget)  # Shortcut column
+                
+                # Connect signal so user can clear orphaned shortcuts
+                widget.keySequenceChanged.connect(lambda menu_item=menuitem, w=widget: self.setkey(menuitem=menu_item,
+                                                                                                   shortcut_widget=w))
             else:
                 # Normal menu item
                 raw_shortcut = menuitem['menuobj'].action().shortcut()
@@ -1189,6 +1192,9 @@ class ShortcutEditorWidget(QtWidgets.QDialog):
                     # Cancel editing - reset widget to original key then stop
                     if not menuitem.get('orphaned', False):
                         shortcut_widget.setShortcut(QtGui.QKeySequence(menuitem['menuobj'].action().shortcut()))
+                    else:
+                        # For orphaned items, reset to the stored shortcut_str
+                        shortcut_widget.setShortcut(QtGui.QKeySequence(menuitem.get('shortcut_str', '')))
                     return
                 elif answer is True:
                     # Un-assign the shortcut first
@@ -1204,8 +1210,11 @@ class ShortcutEditorWidget(QtWidgets.QDialog):
                     # Keep both shortcuts
                     pass
 
-        # Only set shortcut if menu item exists (not orphaned)
+        # Handle shortcut assignment
+        # For orphaned items, we can't apply to Nuke, but we can update preferences
+        # If cleared (empty string), we'll keep it in prefs as empty (user can remove via Reset if desired)
         if not menuitem.get('orphaned', False):
+            # Normal menu item - apply to Nuke
             menuitem['menuobj'].setShortcut(shortcut_str)
         
         cmd_key = "%s/%s" % (menuitem['top_menu_name'], menuitem['menupath'])
